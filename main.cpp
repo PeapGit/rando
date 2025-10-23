@@ -21,6 +21,7 @@
 #include <string>
 #include <limits>
 #include <unistd.h> // For getcwd
+#include <deque>
 
 using u8 = uint8_t;
 using i32 = int32_t;
@@ -91,6 +92,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Pre-calculate walkable areas to speed up BFS
+    std::vector<bool> walkable(total_pixels);
+    for (usize i = 0; i < total_pixels; ++i) {
+        walkable[i] = is_walkable_pixel(image, i * 3);
+    }
+
     // find red start and blue goal (pick first occurrence)
     i32 start_idx = -1;
     i32 goal_idx  = -1;
@@ -115,6 +122,7 @@ int main(int argc, char** argv) {
 
     // BFS structures
     // parent: store parent pixel index (int32_t), -1 means none.
+    // This also implicitly functions as the visited set.
     std::vector<i32> parent;
     try {
         parent.assign(total_pixels, -1);
@@ -124,37 +132,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<u8> visited;
-    try {
-        visited.assign(total_pixels, 0);
-    } catch (const std::bad_alloc&) {
-        std::fprintf(stderr, "Failed to allocate visited array (out of memory)\n");
-        stbi_image_free(image);
-        return 1;
-    }
-
-    std::vector<u32> queue;
-    try {
-        queue.reserve(1024 * 1024); // start small, will grow
-    } catch (...) {}
+    std::deque<u32> queue;
 
     const u32 start_u = (u32)start_idx;
     const u32 goal_u  = (u32)goal_idx;
 
     queue.push_back(start_u);
-    visited[start_u] = 1;
-    parent[start_u] = -1;
+    parent[start_u] = -2; // Use -2 to mark start as visited with no parent
 
     std::fprintf(stderr, "Starting BFS...\n");
 
-    size_t head = 0;
     const int dx[4] = {1,-1,0,0};
     const int dy[4] = {0,0,1,-1};
     bool found = false;
     u32 steps = 0;
 
-    while (head < queue.size()) {
-        u32 cur = queue[head++];
+    while (!queue.empty()) {
+        u32 cur = queue.front();
+        queue.pop_front();
+
         if (cur == goal_u) { found = true; break; }
         u32 cx = cur % (u32)W;
         u32 cy = cur / (u32)W;
@@ -163,20 +159,17 @@ int main(int argc, char** argv) {
             int ny = (int)cy + dy[k];
             if (nx < 0 || ny < 0 || (usize)nx >= W || (usize)ny >= H) continue;
             usize nidx = (usize)ny * W + (usize)nx;
-            if (visited[nidx]) continue;
+            if (parent[nidx] != -1) continue; // Already visited
 
             bool is_goal = (nidx == goal_u);
-            bool is_walkable = is_walkable_pixel(image, nidx * 3);
+            if (!walkable[nidx] && !is_goal) continue;
 
-            if (!is_walkable && !is_goal) continue;
-
-            visited[nidx] = 1;
             parent[nidx] = (i32)cur;
             queue.push_back((u32)nidx);
         }
 
         if (++steps % 10000000 == 0) {
-            std::fprintf(stderr, "BFS progress: queue.size=%zu head=%zu\n", queue.size(), head);
+            std::fprintf(stderr, "BFS progress: queue.size=%zu\n", queue.size());
         }
     }
 
@@ -188,23 +181,17 @@ int main(int argc, char** argv) {
 
     std::fprintf(stderr, "Path found. Reconstructing path...\n");
 
-    // reconstruct path indices (vector holds indices from start -> goal)
-    std::vector<u32> path;
-    {
-        i32 cur = (i32)goal_u;
-        // guard to avoid infinite loop in corrupted parent chain
-        while (cur != -1) {
-            path.push_back((u32)cur);
-            if (cur == (i32)start_u) break;
-            cur = parent[cur];
-            if ((int)path.size() > (int)total_pixels) {
-                std::fprintf(stderr, "Parent chain corrupt, aborting\n");
-                stbi_image_free(image);
-                return 1;
-            }
+    // reconstruct path indices (deque holds indices from start -> goal)
+    std::deque<u32> path;
+    i32 cur = (i32)goal_u;
+    while (cur != -2) { // -2 is the start marker
+        path.push_front((u32)cur);
+        cur = parent[cur];
+        if (cur == -1 || path.size() > total_pixels) {
+            std::fprintf(stderr, "Parent chain corrupt or broken, aborting\n");
+            stbi_image_free(image);
+            return 1;
         }
-        // currently path is goal -> start, reverse to start->goal
-        std::reverse(path.begin(), path.end());
     }
 
     const usize path_len = path.size();
